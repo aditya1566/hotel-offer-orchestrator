@@ -1,0 +1,107 @@
+# Full stack: Temporal (dev server + Web UI), Redis, API, Worker.
+#   docker compose up --build -d
+#   API:          http://localhost:3000
+#   Temporal UI:  http://localhost:8233
+
+name: hotel-offer-orchestrator
+
+x-app-env: &app-env
+  NODE_ENV: production
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  REDIS_URL: redis://redis:6379
+  TEMPORAL_ADDRESS: temporal:7233
+  TEMPORAL_NAMESPACE: default
+  TEMPORAL_TASK_QUEUE: hotel-offers
+  # The mock suppliers are served by the API container.
+  SUPPLIER_A_URL: http://api:3000/supplierA/hotels
+  SUPPLIER_B_URL: http://api:3000/supplierB/hotels
+  SUPPLIER_TIMEOUT_MS: ${SUPPLIER_TIMEOUT_MS:-3000}
+  CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-60}
+  PARTIAL_CACHE_TTL_SECONDS: ${PARTIAL_CACHE_TTL_SECONDS:-10}
+  WORKFLOW_TIMEOUT_MS: ${WORKFLOW_TIMEOUT_MS:-20000}
+  ENABLE_SUPPLIER_SIMULATION: ${ENABLE_SUPPLIER_SIMULATION:-true}
+
+services:
+  temporal:
+    image: temporalio/temporal:1.10.1
+    command:
+      - server
+      - start-dev
+      - --ip=0.0.0.0
+      - --ui-ip=0.0.0.0
+      - --ui-port=8233
+      # Persist workflow history across restarts (SQLite in a named volume).
+      - --db-filename=/home/temporal/temporal.db
+      - --log-level=warn
+    ports:
+      - '${TEMPORAL_PORT:-7233}:7233'
+      - '${TEMPORAL_UI_PORT:-8233}:8233'
+    volumes:
+      # Mounted on the (temporal-owned) home dir so the non-root user can write.
+      - temporal-data:/home/temporal
+    healthcheck:
+      test: ['CMD', 'temporal', 'operator', 'cluster', 'health', '--address', '127.0.0.1:7233']
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    # Pure cache: no persistence, evict only keys that have a TTL.
+    command:
+      ['redis-server', '--save', '', '--appendonly', 'no', '--maxmemory', '128mb', '--maxmemory-policy', 'volatile-lru']
+    ports:
+      - '${REDIS_PORT:-6379}:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    build: .
+    image: hotel-offer-orchestrator:latest
+    init: true
+    environment:
+      <<: *app-env
+      PORT: 3000
+    ports:
+      - '${API_PORT:-3000}:3000'
+    depends_on:
+      redis:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/health/live').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
+  worker:
+    build: .
+    image: hotel-offer-orchestrator:latest
+    init: true
+    command: ['node', 'dist/temporal/worker.js']
+    environment:
+      <<: *app-env
+    depends_on:
+      redis:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  temporal-data:
